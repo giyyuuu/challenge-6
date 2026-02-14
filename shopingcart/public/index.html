@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Persistent Shopping Cart</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛒 Persistent Shopping Cart</h1>
+            <p class="subtitle">Your cart persists across browser sessions and server restarts!</p>
+        </header>
+
+        <div class="main-content">
+            <section class="products-section">
+                <h2>Products</h2>
+                <div class="products-grid" id="productsGrid">
+                    <!-- Products will be loaded here -->
+                </div>
+            </section>
+
+            <section class="cart-section">
+                <div class="cart-header">
+                    <h2>Shopping Cart</h2>
+                    <span class="cart-count" id="cartCount">0</span>
+                </div>
+                <div class="cart-content">
+                    <div id="cartItems" class="cart-items">
+                        <p class="empty-cart">Your cart is empty</p>
+                    </div>
+                    <div class="cart-footer" id="cartFooter" style="display: none;">
+                        <div class="cart-total">
+                            <strong>Total: $<span id="cartTotal">0.00</span></strong>
+                        </div>
+                        <button class="btn btn-clear" id="clearCartBtn">Clear Cart</button>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <div class="status-message" id="statusMessage"></div>
+    </div>
+
+    <script src="cart.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
+
