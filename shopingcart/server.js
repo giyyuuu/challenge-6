@@ -3,87 +3,174 @@ const cookieParser = require('cookie-parser');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const CartDatabase = require('./database');
+const CartValidators = require('./validators');
+const ProductCatalog = require('./product-catalog');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
 
-// Initialize database
+// Initialize services
 const cartDb = new CartDatabase();
+const productCatalog = new ProductCatalog();
 
 // Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' })); // Limit request size
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
 app.use(express.static('public'));
 
-// Session management middleware
+// Security headers middleware
 app.use((req, res, next) => {
-  // Get or create session ID from cookie
-  let sessionId = req.cookies.sessionId;
+  // Prevent clickjacking
+  res.setHeader('X-Frame-Options', 'DENY');
+  // Prevent MIME type sniffing
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // XSS protection
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
+
+// Cart ID management middleware
+// Uses UUID-based cart_id stored in secure cookie
+app.use((req, res, next) => {
+  let cartId = req.cookies.cart_id;
   
-  if (!sessionId) {
-    sessionId = uuidv4();
-    res.cookie('sessionId', sessionId, {
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      httpOnly: true,
-      sameSite: 'lax'
-    });
+  // Validate existing cart_id format
+  if (cartId && !CartValidators.isValidUUID(cartId)) {
+    // Invalid UUID format, generate new one
+    cartId = null;
   }
   
-  req.sessionId = sessionId;
+  // Generate new cart_id if not present
+  if (!cartId) {
+    cartId = uuidv4();
+  }
+  
+  // Set secure cookie with appropriate flags
+  const cookieOptions = {
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    httpOnly: true, // Prevent XSS attacks
+    sameSite: 'lax', // CSRF protection
+    secure: IS_PRODUCTION // Only send over HTTPS in production
+  };
+  
+  res.cookie('cart_id', cartId, cookieOptions);
+  req.cartId = cartId;
   next();
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: IS_PRODUCTION ? undefined : err.message
+  });
 });
 
 // API Routes
 
-// Get cart
+/**
+ * GET /api/cart
+ * Retrieve the current user's cart
+ */
 app.get('/api/cart', (req, res) => {
   try {
-    const cart = cartDb.getCart(req.sessionId);
+    const cart = cartDb.getCart(req.cartId);
     
     if (!cart) {
-      return res.json({ items: [] });
+      return res.json({ items: [], lastUpdated: null });
     }
     
-    res.json({ items: cart.items, lastUpdated: cart.lastUpdated });
+    res.json({ 
+      items: cart.items, 
+      lastUpdated: cart.lastUpdated,
+      itemCount: cart.itemCount
+    });
   } catch (error) {
     console.error('Error getting cart:', error);
     res.status(500).json({ error: 'Failed to get cart' });
   }
 });
 
-// Add item to cart
+/**
+ * POST /api/cart/add
+ * Add an item to the cart
+ * Body: { productId, name, price, quantity?, image? }
+ */
 app.post('/api/cart/add', (req, res) => {
   try {
     const { productId, name, price, quantity = 1, image } = req.body;
     
-    if (!productId || !name || !price) {
-      return res.status(400).json({ error: 'Missing required fields: productId, name, price' });
+    // Validate required fields
+    if (!productId || !name || price === undefined) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: productId, name, price' 
+      });
+    }
+    
+    // Validate product ID against catalog
+    const validProductIds = productCatalog.getValidProductIds();
+    const productIdValidation = CartValidators.validateProductId(productId, validProductIds);
+    if (!productIdValidation.valid) {
+      return res.status(400).json({ error: productIdValidation.error });
+    }
+    
+    // Validate quantity
+    const quantityValidation = CartValidators.validateQuantity(quantity);
+    if (!quantityValidation.valid) {
+      return res.status(400).json({ error: quantityValidation.error });
+    }
+    
+    // Validate price
+    const priceValidation = CartValidators.validatePrice(price);
+    if (!priceValidation.valid) {
+      return res.status(400).json({ error: priceValidation.error });
+    }
+    
+    // Validate product name
+    const nameValidation = CartValidators.validateProductName(name);
+    if (!nameValidation.valid) {
+      return res.status(400).json({ error: nameValidation.error });
     }
     
     // Get existing cart
-    let cart = cartDb.getCart(req.sessionId);
+    let cart = cartDb.getCart(req.cartId);
     let items = cart ? cart.items : [];
     
     // Check if item already exists
-    const existingItemIndex = items.findIndex(item => item.productId === productId);
+    const existingItemIndex = items.findIndex(
+      item => item.productId === productIdValidation.sanitizedId
+    );
     
     if (existingItemIndex >= 0) {
-      // Update quantity
-      items[existingItemIndex].quantity += quantity;
+      // Update quantity (add to existing)
+      const newQuantity = items[existingItemIndex].quantity + quantityValidation.sanitized;
+      
+      // Validate total quantity doesn't exceed max
+      const totalQuantityValidation = CartValidators.validateQuantity(newQuantity);
+      if (!totalQuantityValidation.valid) {
+        return res.status(400).json({ error: totalQuantityValidation.error });
+      }
+      
+      items[existingItemIndex].quantity = totalQuantityValidation.sanitized;
     } else {
-      // Add new item
+      // Add new item with validated data
       items.push({
-        productId,
-        name,
-        price: parseFloat(price),
-        quantity: parseInt(quantity),
-        image: image || null
+        productId: productIdValidation.sanitizedId,
+        name: nameValidation.sanitized,
+        price: priceValidation.sanitized,
+        quantity: quantityValidation.sanitized,
+        image: image && typeof image === 'string' && image.length <= 500 
+          ? image.trim() 
+          : null
       });
     }
     
     // Save to database
-    cartDb.saveCart(req.sessionId, items);
+    cartDb.saveCart(req.cartId, items);
     
     res.json({ success: true, items });
   } catch (error) {
@@ -92,36 +179,63 @@ app.post('/api/cart/add', (req, res) => {
   }
 });
 
-// Update item quantity
+/**
+ * PUT /api/cart/update
+ * Update item quantity in cart
+ * Body: { productId, quantity }
+ */
 app.put('/api/cart/update', (req, res) => {
   try {
     const { productId, quantity } = req.body;
     
+    // Validate required fields
     if (!productId || quantity === undefined) {
-      return res.status(400).json({ error: 'Missing required fields: productId, quantity' });
+      return res.status(400).json({ 
+        error: 'Missing required fields: productId, quantity' 
+      });
     }
     
-    const cart = cartDb.getCart(req.sessionId);
+    // Validate product ID
+    const validProductIds = productCatalog.getValidProductIds();
+    const productIdValidation = CartValidators.validateProductId(productId, validProductIds);
+    if (!productIdValidation.valid) {
+      return res.status(400).json({ error: productIdValidation.error });
+    }
+    
+    // Validate quantity (but allow 0 to remove item)
+    if (quantity < 0) {
+      return res.status(400).json({ error: 'Quantity cannot be negative' });
+    }
+    
+    const cart = cartDb.getCart(req.cartId);
     if (!cart) {
       return res.status(404).json({ error: 'Cart not found' });
     }
     
     let items = cart.items;
-    const itemIndex = items.findIndex(item => item.productId === productId);
+    const itemIndex = items.findIndex(
+      item => item.productId === productIdValidation.sanitizedId
+    );
     
     if (itemIndex < 0) {
       return res.status(404).json({ error: 'Item not found in cart' });
     }
     
-    if (quantity <= 0) {
-      // Remove item
+    // If quantity is 0, remove item
+    if (quantity === 0) {
       items.splice(itemIndex, 1);
     } else {
+      // Validate quantity
+      const quantityValidation = CartValidators.validateQuantity(quantity);
+      if (!quantityValidation.valid) {
+        return res.status(400).json({ error: quantityValidation.error });
+      }
+      
       // Update quantity
-      items[itemIndex].quantity = parseInt(quantity);
+      items[itemIndex].quantity = quantityValidation.sanitized;
     }
     
-    cartDb.saveCart(req.sessionId, items);
+    cartDb.saveCart(req.cartId, items);
     
     res.json({ success: true, items });
   } catch (error) {
@@ -130,18 +244,31 @@ app.put('/api/cart/update', (req, res) => {
   }
 });
 
-// Remove item from cart
+/**
+ * DELETE /api/cart/remove/:productId
+ * Remove an item from the cart
+ */
 app.delete('/api/cart/remove/:productId', (req, res) => {
   try {
     const { productId } = req.params;
     
-    const cart = cartDb.getCart(req.sessionId);
+    // Validate product ID format
+    const validProductIds = productCatalog.getValidProductIds();
+    const productIdValidation = CartValidators.validateProductId(productId, validProductIds);
+    if (!productIdValidation.valid) {
+      return res.status(400).json({ error: productIdValidation.error });
+    }
+    
+    const cart = cartDb.getCart(req.cartId);
     if (!cart) {
       return res.status(404).json({ error: 'Cart not found' });
     }
     
-    let items = cart.items.filter(item => item.productId !== productId);
-    cartDb.saveCart(req.sessionId, items);
+    let items = cart.items.filter(
+      item => item.productId !== productIdValidation.sanitizedId
+    );
+    
+    cartDb.saveCart(req.cartId, items);
     
     res.json({ success: true, items });
   } catch (error) {
@@ -150,10 +277,13 @@ app.delete('/api/cart/remove/:productId', (req, res) => {
   }
 });
 
-// Clear cart
+/**
+ * DELETE /api/cart/clear
+ * Clear all items from the cart
+ */
 app.delete('/api/cart/clear', (req, res) => {
   try {
-    cartDb.saveCart(req.sessionId, []);
+    cartDb.saveCart(req.cartId, []);
     res.json({ success: true, items: [] });
   } catch (error) {
     console.error('Error clearing cart:', error);
@@ -161,38 +291,50 @@ app.delete('/api/cart/clear', (req, res) => {
   }
 });
 
-// Sync cart from localStorage (for browser persistence)
+/**
+ * POST /api/cart/sync
+ * Sync cart from localStorage with server
+ * Body: { items: [...] }
+ */
 app.post('/api/cart/sync', (req, res) => {
   try {
     const { items } = req.body;
     
-    if (!Array.isArray(items)) {
-      return res.status(400).json({ error: 'Items must be an array' });
+    // Validate items array
+    const validProductIds = productCatalog.getValidProductIds();
+    const itemsValidation = CartValidators.validateCartItems(items, validProductIds);
+    
+    if (!itemsValidation.valid) {
+      return res.status(400).json({ error: itemsValidation.error });
     }
     
     // Get server cart
-    const serverCart = cartDb.getCart(req.sessionId);
+    const serverCart = cartDb.getCart(req.cartId);
     const serverItems = serverCart ? serverCart.items : [];
     
-    // Merge strategy: prefer server data if it's newer, otherwise merge
-    let mergedItems = [...serverItems];
+    // Merge strategy: combine items, use maximum quantity for duplicates
+    const mergedItemsMap = new Map();
     
-    // Add or update items from client
-    items.forEach(clientItem => {
-      const existingIndex = mergedItems.findIndex(item => item.productId === clientItem.productId);
-      if (existingIndex >= 0) {
+    // Add server items first
+    serverItems.forEach(item => {
+      mergedItemsMap.set(item.productId, { ...item });
+    });
+    
+    // Merge client items (prefer higher quantity)
+    itemsValidation.sanitized.forEach(clientItem => {
+      const existing = mergedItemsMap.get(clientItem.productId);
+      if (existing) {
         // Use the higher quantity
-        mergedItems[existingIndex].quantity = Math.max(
-          mergedItems[existingIndex].quantity,
-          clientItem.quantity
-        );
+        existing.quantity = Math.max(existing.quantity, clientItem.quantity);
       } else {
-        mergedItems.push(clientItem);
+        mergedItemsMap.set(clientItem.productId, clientItem);
       }
     });
     
+    const mergedItems = Array.from(mergedItemsMap.values());
+    
     // Save merged cart
-    cartDb.saveCart(req.sessionId, mergedItems);
+    cartDb.saveCart(req.cartId, mergedItems);
     
     res.json({ success: true, items: mergedItems });
   } catch (error) {
@@ -201,14 +343,50 @@ app.post('/api/cart/sync', (req, res) => {
   }
 });
 
-// Cleanup endpoint (can be called manually or via cron)
+/**
+ * GET /api/products
+ * Get list of available products
+ */
+app.get('/api/products', (req, res) => {
+  try {
+    const products = productCatalog.getAllProducts();
+    res.json({ products });
+  } catch (error) {
+    console.error('Error getting products:', error);
+    res.status(500).json({ error: 'Failed to get products' });
+  }
+});
+
+/**
+ * POST /api/admin/cleanup
+ * Manually trigger cleanup of expired carts
+ */
 app.post('/api/admin/cleanup', (req, res) => {
   try {
-    const deleted = cartDb.cleanupExpiredCarts();
-    res.json({ success: true, deletedCarts: deleted });
+    const days = req.body.days || 7;
+    const deleted = cartDb.cleanupExpiredCarts(days);
+    res.json({ 
+      success: true, 
+      deletedCarts: deleted,
+      message: `Cleaned up ${deleted} expired cart(s)`
+    });
   } catch (error) {
     console.error('Error cleaning up carts:', error);
     res.status(500).json({ error: 'Failed to cleanup carts' });
+  }
+});
+
+/**
+ * GET /api/admin/stats
+ * Get cart statistics (for monitoring)
+ */
+app.get('/api/admin/stats', (req, res) => {
+  try {
+    const stats = cartDb.getStatistics();
+    res.json(stats);
+  } catch (error) {
+    console.error('Error getting statistics:', error);
+    res.status(500).json({ error: 'Failed to get statistics' });
   }
 });
 
@@ -218,27 +396,42 @@ app.get('/', (req, res) => {
 });
 
 // Start cleanup interval (runs every hour)
+const CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
 setInterval(() => {
   try {
-    const deleted = cartDb.cleanupExpiredCarts();
+    const deleted = cartDb.cleanupExpiredCarts(7);
     if (deleted > 0) {
-      console.log(`Cleaned up ${deleted} expired cart(s)`);
+      console.log(`[Cleanup] Removed ${deleted} expired cart(s)`);
     }
   } catch (error) {
-    console.error('Error in cleanup interval:', error);
+    console.error('[Cleanup] Error in cleanup interval:', error);
   }
-}, 60 * 60 * 1000); // 1 hour
+}, CLEANUP_INTERVAL);
+
+// Run cleanup on startup
+try {
+  const deleted = cartDb.cleanupExpiredCarts(7);
+  if (deleted > 0) {
+    console.log(`[Startup] Cleaned up ${deleted} expired cart(s)`);
+  }
+} catch (error) {
+  console.error('[Startup] Error during initial cleanup:', error);
+}
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log('Persistent shopping cart system initialized');
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`📦 Environment: ${NODE_ENV}`);
+  console.log(`🔒 Secure cookies: ${IS_PRODUCTION ? 'enabled' : 'disabled (dev mode)'}`);
+  console.log('✅ Persistent shopping cart system initialized');
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\nShutting down gracefully...');
+const shutdown = () => {
+  console.log('\n🛑 Shutting down gracefully...');
   cartDb.close();
   process.exit(0);
-});
+};
 
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

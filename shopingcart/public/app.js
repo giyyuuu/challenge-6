@@ -1,14 +1,5 @@
-// Sample products
-const products = [
-  { productId: '1', name: 'Laptop', price: 999.99, image: '💻' },
-  { productId: '2', name: 'Smartphone', price: 699.99, image: '📱' },
-  { productId: '3', name: 'Headphones', price: 199.99, image: '🎧' },
-  { productId: '4', name: 'Keyboard', price: 149.99, image: '⌨️' },
-  { productId: '5', name: 'Monitor', price: 299.99, image: '🖥️' },
-  { productId: '6', name: 'Mouse', price: 49.99, image: '🖱️' },
-  { productId: '7', name: 'Webcam', price: 79.99, image: '📹' },
-  { productId: '8', name: 'Speaker', price: 129.99, image: '🔊' }
-];
+// Products array (loaded from API)
+let products = [];
 
 // Initialize cart manager
 const cartManager = new CartManager();
@@ -21,9 +12,31 @@ const cartTotal = document.getElementById('cartTotal');
 const cartFooter = document.getElementById('cartFooter');
 const clearCartBtn = document.getElementById('clearCartBtn');
 
+// Load products from API
+async function loadProducts() {
+  try {
+    const response = await fetch('/api/products');
+    if (response.ok) {
+      const data = await response.json();
+      products = data.products || [];
+      renderProducts();
+    } else {
+      console.error('Failed to load products');
+      // Fallback to empty array
+      products = [];
+      renderProducts();
+    }
+  } catch (error) {
+    console.error('Error loading products:', error);
+    products = [];
+    renderProducts();
+  }
+}
+
 // Initialize app
-function init() {
-  renderProducts();
+async function init() {
+  // Load products first
+  await loadProducts();
   renderCart();
   
   // Set up event listeners

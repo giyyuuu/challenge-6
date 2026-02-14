@@ -1,4 +1,5 @@
 // Cart management with localStorage persistence
+// Production-ready cart manager with validation and error handling
 class CartManager {
   constructor() {
     this.storageKey = 'shopping_cart';
